@@ -1,0 +1,16 @@
+{
+  "name": "ANGR — Fishing Companion",
+  "short_name": "ANGR",
+  "description": "Log trips and catches, save fishing spots, and check conditions before you head out.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#12140F",
+  "theme_color": "#12140F",
+  "orientation": "portrait",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

@@ -4,6 +4,14 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>ANGR</title>
+  <meta name="description" content="Log trips and catches, save fishing spots, and check conditions before you head out." />
+  <meta name="theme-color" content="#12140F" />
+  <link rel="manifest" href="manifest.json" />
+  <link rel="icon" href="icon-192.png" />
+  <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="ANGR" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
     html, body { margin: 0; padding: 0; background: #0c0e0a; }
@@ -14,6 +22,16 @@
 </head>
 <body>
   <div id="root"></div>
+
+  <script>
+    // Registers the offline app-shell service worker. Uses a relative path
+    // so it works correctly under a GitHub Pages project subpath.
+    if ("serviceWorker" in navigator) {
+      window.addEventListener("load", () => {
+        navigator.serviceWorker.register("sw.js").catch(() => {});
+      });
+    }
+  </script>
 
   <!-- Babel Standalone transpiles JSX (and ES module imports) right in the browser.
        No build step needed — this is the whole app in one HTML file. -->
@@ -218,8 +236,45 @@ const ACHIEVEMENTS = [
 ];
 
 const CONDITIONS_DEMO = { temp: 74, feelsLike: 76, wind: 8, windDir: "SW", weather: "Partly cloudy", humidity: 61, pressure: 30.02, sunrise: "6:42 AM", sunset: "7:58 PM", moon: "Waxing gibbous" };
-const TIDE_DEMO = { next: "High", nextTime: "4:12 PM", following: "Low", followingTime: "10:47 PM" };
 const DEFAULT_WEATHER_LOCATION = { lat: 33.9, lng: -80.6 }; // general Carolinas fallback when location isn't available
+
+/* Real tide predictions via NOAA's free CO-OPS API (no key required).
+   We fetch the full US tide station list once, find the nearest station
+   to a spot, then pull today's high/low predictions for it. */
+let _noaaStationsCache = null;
+async function getNoaaStations() {
+  if (_noaaStationsCache) return _noaaStationsCache;
+  const res = await fetch("https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type=tidepredictions");
+  if (!res.ok) throw new Error("station list request failed");
+  const json = await res.json();
+  _noaaStationsCache = json.stations || [];
+  return _noaaStationsCache;
+}
+function haversineMiles(lat1, lng1, lat2, lng2) {
+  const R = 3958.8;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1), dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+async function fetchNearestTide(lat, lng) {
+  const stations = await getNoaaStations();
+  let nearest = null, nearestDist = Infinity;
+  for (const s of stations) {
+    if (s.lat == null || s.lng == null) continue;
+    const d = haversineMiles(lat, lng, s.lat, s.lng);
+    if (d < nearestDist) { nearestDist = d; nearest = s; }
+  }
+  if (!nearest || nearestDist > 75) return null; // no station close enough to be meaningful
+  const url = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?product=predictions&datum=MLLW&station=${nearest.id}&time_zone=lst_ld&units=english&format=json&date=today&interval=hilo`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("tide predictions request failed");
+  const json = await res.json();
+  const preds = (json.predictions || []).map((p) => ({ time: new Date(p.t.replace(" ", "T")), type: p.type === "H" ? "High" : "Low" }));
+  const now = new Date();
+  const upcoming = preds.filter((p) => p.time > now).slice(0, 2);
+  return { stationName: nearest.name, distanceMiles: Math.round(nearestDist), upcoming };
+}
 
 /* Only checks current location if permission was already granted — never
    triggers a fresh browser prompt on its own, since that belongs to the
@@ -263,12 +318,54 @@ function moonPhaseText(date) {
   const names = ["New Moon", "Waxing Crescent", "First Quarter", "Waxing Gibbous", "Full Moon", "Waning Gibbous", "Last Quarter", "Waning Crescent"];
   return names[idx];
 }
+
+/* Solunar theory: fish feed more actively around when the moon is
+   overhead/underfoot (majors) and around moonrise/moonset (minors).
+   Precise versions need real moonrise/transit astronomy; this uses the
+   standard simplified estimate based on moon age relative to solar noon,
+   which is what most hobbyist solunar calculators use. It's an estimate,
+   not a guarantee — clearly labeled as such wherever it's shown. */
+function solunarPeriods(date) {
+  const synodic = 29.53058867;
+  const knownNewMoon = Date.UTC(2000, 0, 6, 18, 14);
+  const ageDays = (((date.getTime() - knownNewMoon) / 86400000) % synodic + synodic) % synodic;
+  const offsetHours = (ageDays / synodic) * 24;
+  const solarNoon = new Date(date); solarNoon.setHours(12, 0, 0, 0);
+  const addHours = (d, h) => new Date(d.getTime() + h * 3600000);
+  const major1 = addHours(solarNoon, offsetHours);
+  const major2 = addHours(major1, 12);
+  const minor1 = addHours(major1, -6);
+  const minor2 = addHours(major1, 6);
+  const fmt = (d) => d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  return [
+    { type: "Major", time: fmt(major1), raw: major1 },
+    { type: "Minor", time: fmt(minor1), raw: minor1 },
+    { type: "Major", time: fmt(major2), raw: major2 },
+    { type: "Minor", time: fmt(minor2), raw: minor2 },
+  ].sort((a, b) => a.raw - b.raw);
+}
+function solunarRating(date) {
+  const synodic = 29.53058867;
+  const knownNewMoon = Date.UTC(2000, 0, 6, 18, 14);
+  const ageDays = (((date.getTime() - knownNewMoon) / 86400000) % synodic + synodic) % synodic;
+  const distToNew = Math.min(ageDays, synodic - ageDays);
+  const distToFull = Math.abs(ageDays - synodic / 2);
+  const dist = Math.min(distToNew, distToFull);
+  return Math.max(1, Math.min(5, Math.round(5 - (dist / (synodic / 4)) * 4)));
+}
+
 async function fetchWeather(lat, lng) {
-  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}&current=temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,wind_direction_10m,surface_pressure,weather_code&daily=sunrise,sunset&timezone=auto&temperature_unit=fahrenheit&wind_speed_unit=mph&pressure_unit=inhg`;
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}&current=temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,wind_direction_10m,surface_pressure,weather_code&daily=sunrise,sunset,temperature_2m_max,temperature_2m_min,weather_code&forecast_days=4&timezone=auto&temperature_unit=fahrenheit&wind_speed_unit=mph&pressure_unit=inhg`;
   const res = await fetch(url);
   if (!res.ok) throw new Error("weather request failed");
   const json = await res.json();
   const c = json.current;
+  const upcoming = (json.daily.time || []).slice(1, 4).map((dateStr, i) => ({
+    label: new Date(dateStr + "T12:00").toLocaleDateString(undefined, { weekday: "short" }),
+    hi: Math.round(json.daily.temperature_2m_max[i + 1]),
+    lo: Math.round(json.daily.temperature_2m_min[i + 1]),
+    weather: WMO_WEATHER[json.daily.weather_code[i + 1]] || "—",
+  }));
   return {
     temp: Math.round(c.temperature_2m),
     feelsLike: Math.round(c.apparent_temperature),
@@ -280,6 +377,7 @@ async function fetchWeather(lat, lng) {
     sunrise: fmtTimeFromISO(json.daily.sunrise[0]),
     sunset: fmtTimeFromISO(json.daily.sunset[0]),
     moon: moonPhaseText(new Date()),
+    upcoming,
   };
 }
 
@@ -641,6 +739,16 @@ function ConditionsCard() {
           </div>
         ))}
       </div>
+      {state.status === "ready" && c.upcoming && c.upcoming.length > 0 && (
+        <div style={{ display: "flex", gap: 8, marginTop: 12, paddingTop: 12, borderTop: "1px solid #242A1D" }}>
+          {c.upcoming.map((d, i) => (
+            <div key={i} style={{ flex: 1, textAlign: "center", background: "#161A12", borderRadius: 10, padding: "8px 4px" }}>
+              <div style={{ fontSize: 10, color: "#7A8270", fontWeight: 700 }}>{d.label}</div>
+              <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, color: "#F2EFE6", marginTop: 4 }}>{d.hi}°<span style={{ color: "#7A8270" }}>/{d.lo}°</span></div>
+            </div>
+          ))}
+        </div>
+      )}
       {state.status === "ready" && !usedDeviceLocation && (
         <div style={{ marginTop: 10, fontSize: 10.5, color: "#5C6353", display: "flex", alignItems: "center", gap: 5 }}>
           <Info size={11} /> Showing conditions for a general area — enable location in Profile for your exact spot.
@@ -651,6 +759,32 @@ function ConditionsCard() {
           <Info size={11} /> Couldn't reach the weather service — showing placeholder data.
         </div>
       )}
+    </Card>
+  );
+}
+
+function SolunarCard() {
+  const periods = useMemo(() => solunarPeriods(new Date()), []);
+  const rating = useMemo(() => solunarRating(new Date()), []);
+  return (
+    <Card>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+        <div style={{ fontFamily: "'Fraunces', serif", fontWeight: 700, fontSize: 15, color: "#F2EFE6" }}>Best Times Today</div>
+        <div style={{ display: "flex", gap: 2 }}>
+          {[1, 2, 3, 4, 5].map((n) => <Star key={n} size={13} color={n <= rating ? "#D9A441" : "#3A4530"} fill={n <= rating ? "#D9A441" : "none"} />)}
+        </div>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 8 }}>
+        {periods.map((p, i) => (
+          <div key={i} style={{ textAlign: "center" }}>
+            <Pill tone={p.type === "Major" ? "rust" : "muted"}>{p.type}</Pill>
+            <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12.5, color: "#F2EFE6", fontWeight: 600, marginTop: 6 }}>{p.time}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{ marginTop: 10, fontSize: 10.5, color: "#5C6353", display: "flex", alignItems: "center", gap: 5 }}>
+        <Info size={11} /> Solunar estimate based on moon phase — a guide, not a guarantee.
+      </div>
     </Card>
   );
 }
@@ -686,6 +820,7 @@ function Home({ data, stats, units, onStartFishing, onOpenTrip, onGoMap, onGoTab
       </div>
 
       <div style={{ marginBottom: 20 }}><ConditionsCard /></div>
+      <div style={{ marginBottom: 20 }}><SolunarCard /></div>
 
       <SectionHeader title="Recent Trips" onSeeAll={() => onGoTab("log")} />
       {recentTrips.length === 0 ? (
@@ -787,6 +922,39 @@ function MapBridge({ onReady }) {
   const map = useMap();
   useEffect(() => { onReady(map); }, [map]);
   return null;
+}
+
+function TideInfo({ spot }) {
+  const [state, setState] = useState({ status: "loading" });
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const result = await fetchNearestTide(spot.lat, spot.lng);
+        if (cancelled) return;
+        setState(result ? { status: "ready", data: result } : { status: "none" });
+      } catch (e) {
+        if (!cancelled) setState({ status: "error" });
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [spot.id]);
+
+  if (state.status === "loading") return <div style={{ fontSize: 12, color: "#7A8270" }}>Loading tide data…</div>;
+  if (state.status === "none") return null;
+  if (state.status === "error") {
+    return <div style={{ fontSize: 12, color: "#5C6353" }}>Couldn't load tide data for this spot right now.</div>;
+  }
+  const { data } = state;
+  if (data.upcoming.length === 0) {
+    return <div><b style={{ color: "#9CA394" }}>Tide:</b> No more changes today at {data.stationName}.</div>;
+  }
+  return (
+    <div>
+      <b style={{ color: "#9CA394" }}>Tide</b> <span style={{ color: "#5C6353" }}>({data.stationName}, {data.distanceMiles}mi)</span>: {data.upcoming.map((p) => `${p.type} ${p.time.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}`).join(" → ")}
+    </div>
+  );
 }
 
 function MapScreen({ data, onAddSpot, onDeleteSpot }) {
@@ -921,7 +1089,7 @@ function MapScreen({ data, onAddSpot, onDeleteSpot }) {
             <div><b style={{ color: "#9CA394" }}>Best bait:</b> {selected.bait}</div>
             <div><b style={{ color: "#9CA394" }}>Best time:</b> {selected.bestTime}</div>
             {selected.species.some((sp) => combinedSpecies(data).find((s) => s.name === sp)?.water === "saltwater") && (
-              <div><b style={{ color: "#9CA394" }}>Tide:</b> {TIDE_DEMO.next} {TIDE_DEMO.nextTime} → {TIDE_DEMO.following} {TIDE_DEMO.followingTime} <span style={{ color: "#5C6353" }}>(placeholder)</span></div>
+              <TideInfo spot={selected} />
             )}
             {selected.notes && <div><b style={{ color: "#9CA394" }}>Notes:</b> {selected.notes}</div>}
           </div>
@@ -1336,7 +1504,7 @@ function Discover({ data, onOpenSpecies, onAddSpecies, onUpdateSpecies, onDelete
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
         <Card><div style={{ fontWeight: 700, color: "#F2EFE6", marginBottom: 4 }}>🍂 Fall feeding window</div><div style={{ fontSize: 12.5, color: "#9CA394", lineHeight: 1.6 }}>As water cools, baitfish move shallow and predators follow — cover water fast with reaction baits before slowing down near cover.</div></Card>
         <Card><div style={{ fontWeight: 700, color: "#F2EFE6", marginBottom: 4 }}>🌡️ Reading pressure</div><div style={{ fontSize: 12.5, color: "#9CA394", lineHeight: 1.6 }}>Falling barometric pressure ahead of a front often triggers aggressive feeding — a good window to be on the water.</div></Card>
-        <Card><div style={{ fontWeight: 700, color: "#F2EFE6", marginBottom: 4 }}>🌊 Fish the tide change</div><div style={{ fontSize: 12.5, color: "#9CA394", lineHeight: 1.6 }}>Next {TIDE_DEMO.next.toLowerCase()} tide is around {TIDE_DEMO.nextTime} — moving water right around the turn is usually when coastal species feed hardest. <span style={{ color: "#5C6353" }}>(placeholder — wire up a tide API for your coast)</span></div></Card>
+        <Card><div style={{ fontWeight: 700, color: "#F2EFE6", marginBottom: 4 }}>🌊 Fish the tide change</div><div style={{ fontSize: 12.5, color: "#9CA394", lineHeight: 1.6 }}>Moving water right around a tide turn is usually when coastal species feed hardest. Check the tide info on any saltwater spot's map card for today's exact high and low times near it.</div></Card>
       </div>
     </div>
   );
